@@ -5,83 +5,63 @@ const buildQuery = require('../utils/query');
 const { ok, fail } = require('./resp');
 
 // helpers
-const toBool = (v) => v === true || v === 'true' || v === 'on' || v === '1';
-const toDate = (v) =>
-  v === undefined || v === null || v === '' ? undefined : new Date(Number(v));
+const toArray = (v) => (Array.isArray(v) ? v : (v == null ? [] : [v]));
 
 module.exports = function (router) {
   // /api/tasks
   router
     .route('/')
-    // GET /api/tasks
+    // GET list with query params (where/sort/select/skip/limit/count)
     .get(async (req, res) => {
       try {
-      
         const { q, count, applyLimit } = buildQuery(Task, req.query);
-
-      
-        const limit = applyLimit(req.query.limit, 100);
+        const limit = applyLimit(req.query.limit, 100); // default 100 for tasks
         if (limit !== undefined) q.limit(limit);
-
-        if (count) {
-          
-          const total = await Task.countDocuments(q.getQuery());
-          return ok(res, total);
-        }
-
-        const docs = await q.exec();
-        return ok(res, docs);
+        if (count) return ok(res, await Task.countDocuments(q.getQuery()));
+        return ok(res, await q.exec());
       } catch (e) {
         return fail(res, e.status || 400, e.message || 'Bad request');
       }
     })
-
-    // POST /api/tasks
+    // POST create task
     .post(async (req, res) => {
       try {
+        // Spec: name + deadline required; description optional
         const {
           name,
-          description,
+          description = '',
           deadline,
           completed,
           assignedUser,
           assignedUserName,
         } = req.body;
 
-        if (!name || !description) {
-          return fail(res, 400, 'name and description are required');
-        }
-        if (deadline === undefined) {
+        if (!name) return fail(res, 400, 'name is required');
+        if (deadline === undefined)
           return fail(res, 400, 'deadline (ms epoch) is required');
-        }
 
-        let assignedId = assignedUser || null;
-        let assignedName = assignedUserName || 'unassigned';
-
-        if (assignedId && assignedId !== 'unassigned') {
-          const u = await User.findById(assignedId);
+        // Validate assignment (if any)
+        let assignedId = null;
+        let assignedName = 'unassigned';
+        if (assignedUser && assignedUser !== 'unassigned') {
+          const u = await User.findById(assignedUser);
           if (!u) return fail(res, 400, 'assignedUser does not exist');
           assignedId = u._id;
           assignedName = u.name;
-        } else {
-          assignedId = null;
-          assignedName = 'unassigned';
         }
 
-        // Create task; store deadline as Date and completed as Boolean
         const task = new Task({
           name,
           description,
-          deadline: toDate(deadline),
-          completed: toBool(completed),
+          deadline,
+          completed: !!completed,
           assignedUser: assignedId,
           assignedUserName: assignedName,
         });
-
         await task.save();
 
-        // Two-way: add to user.pendingTasks if assigned
-        if (assignedId) {
+        // Two-way add only if assigned AND task is pending (completed === false)
+        if (assignedId && task.completed === false) {
           await User.findByIdAndUpdate(assignedId, {
             $addToSet: { pendingTasks: task._id },
           });
@@ -96,73 +76,69 @@ module.exports = function (router) {
   // /api/tasks/:id
   router
     .route('/:id')
-    // GET /api/tasks/:id (+select support)
+    // GET single (supports ?select=)
     .get(async (req, res) => {
       try {
-        const id = req.params.id;
-        let projection = {};
-        if (req.query.select) {
-          try {
-            projection = JSON.parse(req.query.select);
-          } catch {
-            return fail(res, 400, 'Invalid JSON for select');
-          }
-        }
-        const doc = await Task.findById(id, projection);
+        const base = Task.findById(req.params.id);
+        if (req.query.select) base.select(JSON.parse(req.query.select));
+        const doc = await base.exec();
         if (!doc) return fail(res, 404, 'Not Found');
         return ok(res, doc);
       } catch (e) {
         return fail(res, 400, e.message || 'Bad request');
       }
     })
-
-    // PUT /api/tasks/:id (replace doc; maintain two-way references)
+    // PUT replace entire task
     .put(async (req, res) => {
       try {
         const id = req.params.id;
-        const payload = req.body;
+        const p = req.body;
 
-        if (!payload.name || !payload.description || payload.deadline === undefined) {
-          return fail(res, 400, 'name, description, and deadline are required');
+        if (!p.name || p.deadline === undefined) {
+          return fail(res, 400, 'name and deadline are required');
         }
 
-        const prev = await Task.findById(id);
-        if (!prev) return fail(res, 404, 'Not Found');
-
-        // Determine new assignment
+        // Resolve new assignment (if provided)
         let newAssignedId = null;
         let newAssignedName = 'unassigned';
-
-        if (payload.assignedUser && payload.assignedUser !== 'unassigned') {
-          const u = await User.findById(payload.assignedUser);
+        if (p.assignedUser && p.assignedUser !== 'unassigned') {
+          const u = await User.findById(p.assignedUser);
           if (!u) return fail(res, 400, 'assignedUser does not exist');
           newAssignedId = u._id;
           newAssignedName = u.name;
         }
 
+        const prev = await Task.findById(id);
+        if (!prev) return fail(res, 404, 'Not Found');
+
         const updated = await Task.findByIdAndUpdate(
           id,
           {
-            name: payload.name,
-            description: payload.description,
-            deadline: toDate(payload.deadline),
-            completed: toBool(payload.completed),
+            name: p.name,
+            description: p.description ?? prev.description ?? '',
+            deadline: p.deadline,
+            completed: !!p.completed,
             assignedUser: newAssignedId,
             assignedUserName: newAssignedName,
           },
           { new: true, runValidators: true, overwrite: true }
         );
 
-        // Two-way maintenance
-        const prevUser = prev.assignedUser?.toString();
-        const nextUser = newAssignedId?.toString();
+        // Two-way reconciliation
+        const prevUser = prev.assignedUser ? String(prev.assignedUser) : null;
+        const nextUser = newAssignedId ? String(newAssignedId) : null;
+        const prevDone = !!prev.completed;
+        const nextDone = !!updated.completed;
 
-        if (prevUser && prevUser !== nextUser) {
+        // Remove from previous user's pending if user changed OR task just became completed
+        if (prevUser && (prevUser !== nextUser || (!prevDone && nextDone))) {
           await User.findByIdAndUpdate(prevUser, {
             $pull: { pendingTasks: updated._id },
           });
         }
-        if (nextUser && prevUser !== nextUser) {
+
+        // Ensure presence in next user's pending if assigned & not completed
+        if (nextUser && nextDone === false) {
           await User.findByIdAndUpdate(nextUser, {
             $addToSet: { pendingTasks: updated._id },
           });
@@ -173,21 +149,21 @@ module.exports = function (router) {
         return fail(res, 400, e.message || 'Bad request');
       }
     })
-
-    // DELETE /api/tasks/:id (remove two-way link; return 204)
+    // DELETE task
     .delete(async (req, res) => {
       try {
         const id = req.params.id;
         const task = await Task.findByIdAndDelete(id);
         if (!task) return fail(res, 404, 'Not Found');
 
+        // Two-way cleanup (remove from user's pendingTasks)
         if (task.assignedUser) {
           await User.findByIdAndUpdate(task.assignedUser, {
             $pull: { pendingTasks: task._id },
           });
         }
 
-        return res.status(204).send();
+        return ok(res, task);
       } catch (e) {
         return fail(res, 400, e.message || 'Bad request');
       }

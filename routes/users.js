@@ -1,143 +1,132 @@
 // routes/users.js
+const mongoose = require('mongoose');
 const User = require('../models/user');
 const Task = require('../models/task');
 const buildQuery = require('../utils/query');
 const { ok, fail } = require('./resp');
 
+// helpers
+const toArray = (v) => (Array.isArray(v) ? v : (v == null ? [] : [v]));
+const asObjectIdSet = (arr) => new Set(toArray(arr).map((x) => String(x)));
+
 module.exports = function (router) {
   // /api/users
   router
     .route('/')
-    // GET /api/users
+    // GET list with query params; no default limit for users
     .get(async (req, res) => {
       try {
-        const { q, count, applyLimit } = buildQuery(User, req.query);
-
-       
-        const limit = applyLimit(req.query.limit, undefined);
-        if (limit !== undefined) q.limit(limit);
-
-        if (count) {
-          const total = await User.countDocuments(q.getQuery());
-          return ok(res, total);
-        }
-
-        const docs = await q.exec();
-        return ok(res, docs);
+        const { q, count } = buildQuery(User, req.query);
+        if (count) return ok(res, await User.countDocuments(q.getQuery()));
+        return ok(res, await q.exec());
       } catch (e) {
         return fail(res, e.status || 400, e.message || 'Bad request');
       }
     })
-
-    // POST /api/users
+    // POST create user (and optional pendingTasks two-way)
     .post(async (req, res) => {
       try {
-        const { name, email, pendingTasks } = req.body;
+        const { name, email } = req.body;
         if (!name || !email) return fail(res, 400, 'name and email are required');
 
-        const exists = await User.findOne({ email });
-        if (exists) return fail(res, 400, 'email already exists');
+        // Normalize pendingTasks input but only keep *pending* tasks
+        const requestedPending = asObjectIdSet(req.body['pendingTasks'] ?? req.body['pendingTasks[]']);
+        const tasks = requestedPending.size
+          ? await Task.find({ _id: { $in: Array.from(requestedPending) } })
+          : [];
+        const pendingOnly = tasks.filter((t) => !t.completed).map((t) => t._id);
 
+        // Create the user with filtered pending tasks
         const user = new User({
           name,
           email,
-          pendingTasks: Array.isArray(pendingTasks) ? pendingTasks : [],
+          pendingTasks: pendingOnly,
         });
 
         await user.save();
 
-        if (user.pendingTasks.length) {
+        // Assign those tasks to this user (two-way)
+        if (pendingOnly.length) {
           await Task.updateMany(
-            { _id: { $in: user.pendingTasks } },
+            { _id: { $in: pendingOnly } },
             { $set: { assignedUser: user._id, assignedUserName: user.name } }
           );
         }
 
         return ok(res, user, 201);
       } catch (e) {
-        return fail(res, 400, e.message || 'Bad request');
+        if (String(e).includes('duplicate key')) {
+          return fail(res, 400, 'email must be unique');
+        }
+        return fail(res, 400, 'Bad request');
       }
     });
 
   // /api/users/:id
   router
     .route('/:id')
-    // GET /api/users/:id (+select support)
+    // GET single (supports ?select=)
     .get(async (req, res) => {
       try {
-        const id = req.params.id;
-        let projection = {};
-        if (req.query.select) {
-          try {
-            projection = JSON.parse(req.query.select);
-          } catch {
-            return fail(res, 400, 'Invalid JSON for select');
-          }
-        }
-        const doc = await User.findById(id, projection);
+        const base = User.findById(req.params.id);
+        if (req.query.select) base.select(JSON.parse(req.query.select));
+        const doc = await base.exec();
         if (!doc) return fail(res, 404, 'Not Found');
         return ok(res, doc);
       } catch (e) {
-        return fail(res, 400, e.message || 'Bad request');
+        return fail(res, 400, 'Bad request');
       }
     })
-
-    // PUT /api/users/:id (replace entire user; maintain two-way with tasks)
+    // PUT replace entire user (and reconcile two-way)
     .put(async (req, res) => {
       try {
         const id = req.params.id;
-        const payload = req.body;
+        const p = req.body;
 
-        if (!payload.name || !payload.email) {
+        if (!p.name || !p.email)
           return fail(res, 400, 'name and email are required');
-        }
 
-        const prev = await User.findById(id);
-        if (!prev) return fail(res, 404, 'Not Found');
+        const existing = await User.findById(id);
+        if (!existing) return fail(res, 404, 'Not Found');
 
-        const dup = await User.findOne({ email: payload.email, _id: { $ne: id } });
-        if (dup) return fail(res, 400, 'email already exists');
+        // Normalize new pendingTasks and filter to only *pending* tasks
+        const requestedPending = asObjectIdSet(p['pendingTasks'] ?? p['pendingTasks[]']);
+        const tasks = requestedPending.size
+          ? await Task.find({ _id: { $in: Array.from(requestedPending) } })
+          : [];
+        const assignable = tasks.filter((t) => !t.completed).map((t) => String(t._id));
+        const assignableSet = new Set(assignable);
 
-        const nextPending = Array.isArray(payload.pendingTasks) ? payload.pendingTasks : [];
-
-        // Replace user
+        // 1) Update the User document first with filtered list
         const updated = await User.findByIdAndUpdate(
           id,
-          {
-            name: payload.name,
-            email: payload.email,
-            pendingTasks: nextPending,
-          },
+          { name: p.name, email: p.email, pendingTasks: Array.from(assignableSet) },
           { new: true, runValidators: true, overwrite: true }
         );
 
-        const prevSet = new Set((prev.pendingTasks || []).map(String));
-        const nextSet = new Set((nextPending || []).map(String));
+        // 2) Unassign tasks that were assigned to this user but are not in the new list
+        await Task.updateMany(
+          { assignedUser: id, _id: { $nin: Array.from(assignableSet) } },
+          { $set: { assignedUser: null, assignedUserName: 'unassigned' } }
+        );
 
-        const removed = [...prevSet].filter((t) => !nextSet.has(t));
-        if (removed.length) {
+        // 3) Assign all tasks from the new list to this user (they are guaranteed not completed)
+        if (assignable.length) {
           await Task.updateMany(
-            { _id: { $in: removed }, assignedUser: id },
-            { $set: { assignedUser: null, assignedUserName: 'unassigned' } }
-          );
-        }
-
-        // Tasks newly added -> assign to this user
-        const added = [...nextSet].filter((t) => !prevSet.has(t));
-        if (added.length) {
-          await Task.updateMany(
-            { _id: { $in: added } },
+            { _id: { $in: Array.from(assignableSet) } },
             { $set: { assignedUser: id, assignedUserName: updated.name } }
           );
         }
 
         return ok(res, updated);
       } catch (e) {
-        return fail(res, 400, e.message || 'Bad request');
+        if (String(e).includes('duplicate key')) {
+          return fail(res, 400, 'email must be unique');
+        }
+        return fail(res, 400, 'Bad request');
       }
     })
-
-    // DELETE /api/users/:id (unassign their tasks; return 204)
+    // DELETE user (unassign all their tasks)
     .delete(async (req, res) => {
       try {
         const id = req.params.id;
@@ -149,9 +138,9 @@ module.exports = function (router) {
           { $set: { assignedUser: null, assignedUserName: 'unassigned' } }
         );
 
-        return res.status(204).send();
+        return ok(res, user);
       } catch (e) {
-        return fail(res, 400, e.message || 'Bad request');
+        return fail(res, 400, 'Bad request');
       }
     });
 

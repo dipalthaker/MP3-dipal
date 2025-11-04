@@ -1,13 +1,16 @@
-var mongoose = require('mongoose');
+// models/user.js
+const mongoose = require('mongoose');
 
-var UserSchema = new mongoose.Schema({
-  name: { type: String, required: [true, 'name is required'] },
-  email: {
-    type: String, required: [true, 'email is required'], unique: true,
-    match: [/^\S+@\S+\.\S+$/, 'email is invalid']
+const UserSchema = new mongoose.Schema(
+  {
+    name:  { type: String, required: true },
+    email: { type: String, required: true, unique: true, index: true },
+    // pending tasks must reference Task ids
+    pendingTasks: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Task' }],
   },
-  pendingTasks: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Task', default: [] }],
-  dateCreated: { type: Date, default: Date.now }
-}, { versionKey: false });
+  {
+    timestamps: { createdAt: 'dateCreated', updatedAt: false }
+  }
+);
 
 module.exports = mongoose.model('User', UserSchema);
